@@ -1,0 +1,39 @@
+# Dockerfile.osc — Keycloak adapted for the Eyevinn Open Source Cloud
+#
+# The official Keycloak image is built on ubi9-micro, which ships without a
+# shell. The OSC entrypoint requires bash, so the final image is rebuilt on
+# ubi9-minimal (which provides microdnf + bash) with a headless JDK 21, and
+# the Keycloak distribution is copied verbatim from the official image.
+
+# --- Keycloak distribution --------------------------------------------------
+FROM quay.io/keycloak/keycloak:26.6.2 AS kc-dist
+
+# --- Runtime image ----------------------------------------------------------
+FROM registry.access.redhat.com/ubi9-minimal AS final
+
+ENV LANG=en_US.UTF-8
+# Flag for determining the app is running in a container.
+ENV KC_RUN_IN_CONTAINER=true
+
+RUN microdnf install -y java-21-openjdk-headless bash glibc-langpack-en findutils \
+    && microdnf clean all
+
+COPY --from=kc-dist /opt/keycloak /opt/keycloak
+
+# Recreate the keycloak user/group (uid 1000, root group) used by the
+# official image and make the install group-writable for arbitrary UIDs.
+RUN echo "keycloak:x:0:root" >> /etc/group \
+    && echo "keycloak:x:1000:0:keycloak user:/opt/keycloak:/sbin/nologin" >> /etc/passwd \
+    && chown -R 1000:0 /opt/keycloak \
+    && chmod -R g+rwX /opt/keycloak
+
+COPY --chmod=755 osc-entrypoint.sh /usr/local/bin/osc-entrypoint.sh
+
+USER 1000
+
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/osc-entrypoint.sh"]
+# Non-optimized "start" so Keycloak re-augments for the database vendor
+# selected at runtime (postgres/mysql/mariadb or the embedded dev-file store).
+CMD ["/opt/keycloak/bin/kc.sh", "start"]

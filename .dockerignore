@@ -1,0 +1,10 @@
+.git
+.github
+.idea
+*.md
+docs
+js/**/node_modules
+**/target
+**/node_modules
+*.log
+.env
