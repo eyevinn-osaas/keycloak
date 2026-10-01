@@ -8,6 +8,16 @@
 # --- Keycloak distribution --------------------------------------------------
 FROM quay.io/keycloak/keycloak:26.6.2 AS kc-dist
 
+# --- BCrypt password hash provider -------------------------------------------
+# Keycloak ships without bcrypt, so credentials with algorithm "bcrypt"
+# ($2a$/$2b$ hashes) are rejected at login. This provider registers it.
+FROM registry.access.redhat.com/ubi9-minimal AS bcrypt-provider
+ARG BCRYPT_VERSION=1.7.0
+ARG BCRYPT_SHA256=b32a7557c1bdcf67da9bfde075b20aabd00d26e04aa4db2ba85765b8e94c9f28
+RUN curl -fsSL -o /keycloak-bcrypt.jar \
+      https://github.com/leroyguillaume/keycloak-bcrypt/releases/download/v${BCRYPT_VERSION}/keycloak-bcrypt-${BCRYPT_VERSION}.jar \
+    && echo "${BCRYPT_SHA256}  /keycloak-bcrypt.jar" | sha256sum -c -
+
 # --- Runtime image ----------------------------------------------------------
 FROM registry.access.redhat.com/ubi9-minimal AS final
 
@@ -19,6 +29,7 @@ RUN microdnf install -y java-21-openjdk-headless bash glibc-langpack-en findutil
     && microdnf clean all
 
 COPY --from=kc-dist /opt/keycloak /opt/keycloak
+COPY --from=bcrypt-provider /keycloak-bcrypt.jar /opt/keycloak/providers/keycloak-bcrypt.jar
 
 # Recreate the keycloak user/group (uid 1000, root group) used by the
 # official image and make the install group-writable for arbitrary UIDs.
