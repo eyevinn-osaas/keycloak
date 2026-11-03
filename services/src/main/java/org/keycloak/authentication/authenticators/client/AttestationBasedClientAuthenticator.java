@@ -96,6 +96,9 @@ public class AttestationBasedClientAuthenticator extends AbstractClientAuthentic
      */
     public static final String OAUTH_CLIENT_ATTESTATION_CONFIG_TRUST_IDPS = "attester_trust_idps";
 
+    /** The token confirmation type */
+    public static final String ABCA_JKT_TYPE = "Client-Attestation";
+
     @Override
     public String getId() {
         return PROVIDER_ID;
@@ -183,6 +186,11 @@ public class AttestationBasedClientAuthenticator extends AbstractClientAuthentic
     @Override
     public Map<String, Object> getAdapterConfiguration(KeycloakSession session, ClientModel client) {
         return Map.of();
+    }
+
+    @Override
+    public Set<String> getAdapterConfigurationSecretKeys() {
+        return Set.of();
     }
 
     @Override

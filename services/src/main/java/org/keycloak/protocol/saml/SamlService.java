@@ -76,6 +76,7 @@ import org.keycloak.events.Errors;
 import org.keycloak.events.EventBuilder;
 import org.keycloak.events.EventType;
 import org.keycloak.executors.ExecutorsProvider;
+import org.keycloak.headers.SecurityHeadersUtils;
 import org.keycloak.http.HttpRequest;
 import org.keycloak.http.HttpResponse;
 import org.keycloak.models.AuthenticatedClientSessionModel;
@@ -136,7 +137,6 @@ import org.keycloak.sessions.AuthenticationSessionModel;
 import org.keycloak.sessions.CommonClientSessionModel;
 import org.keycloak.timer.ScheduledTask;
 import org.keycloak.transaction.AsyncResponseTransaction;
-import org.keycloak.utils.KeycloakSessionUtil;
 import org.keycloak.utils.MediaType;
 
 import org.apache.http.client.methods.CloseableHttpResponse;
@@ -271,6 +271,19 @@ public class SamlService extends AuthorizationEndpointBase {
             }
 
             session.getContext().setClient(client);
+
+            SamlClient samlClient = new SamlClient(client);
+            try {
+                if(samlClient.requiresClientSignature()) {
+                    verifyResponseSignature(holder,client);
+                }
+            } catch (VerificationException e) {
+                SamlService.logger.error("LogoutResponse signature validation failed");
+                SamlService.logger.debug("LogoutResponse signature validation failed", e);
+                event.error(Errors.INVALID_SIGNATURE);
+                return error(session, null, Response.Status.BAD_REQUEST, Messages.INVALID_REQUESTER);
+            }
+
             logger.debug("logout response");
             Response response = authManager.browserLogout(session, realm, userSession, session.getContext().getUri(), clientConnection, headers);
             event.success();
@@ -371,9 +384,12 @@ public class SamlService extends AuthorizationEndpointBase {
          * sending an ArtifactResolve, receiving an ArtifactResponse, and handling its content based on the "standard"
          * workflows.
          *
+         * <p>SOAP artifact resolution runs on {@code saml-artifact-pool} so a slow SP does not block a shared HTTP
+         * worker. {@link AsyncResponseTransaction} applies browser security headers to the response that is actually
+         * resumed after commit or rollback.
+         *
          * @param artifact the received artifact
          * @param relayState the current relay state
-         * @return a Response based on the content of the ArtifactResponse's content
          */
         protected void handleArtifact(AsyncResponse asyncResponse, String artifact, String relayState) {
             logger.tracef("Keycloak obtained artifact %s. %s", artifact, getShortStackTrace());
@@ -384,7 +400,7 @@ public class SamlService extends AuthorizationEndpointBase {
 
                 Response error = checkClientValidity(client);
                 if (error != null) {
-                    asyncResponse.resume(error);
+                    asyncResponse.resume(withBrowserSecurityHeaders(session, error));
                     return;
                 }
 
@@ -392,7 +408,7 @@ public class SamlService extends AuthorizationEndpointBase {
                 event.event(EventType.LOGIN);
                 event.detail(Details.REASON, e.getMessage());
                 event.error(Errors.INVALID_SAML_ARTIFACT);
-                asyncResponse.resume(error(session, null, Response.Status.BAD_REQUEST, Messages.INVALID_REQUEST));
+                asyncResponse.resume(withBrowserSecurityHeaders(session, error(session, null, Response.Status.BAD_REQUEST, Messages.INVALID_REQUEST)));
                 return;
             }
 
@@ -425,23 +441,20 @@ public class SamlService extends AuthorizationEndpointBase {
                 ScheduledTaskRunner task = new ScheduledTaskRunner(session.getKeycloakSessionFactory(), artifactResolutionRunnable);
                 executor.execute(task);
 
-                logger.tracef("ArtifactResolutionRunnable scheduled, current transaction will be rolled back");
-                // Current transaction must be ignored due to asyncResponse.
-                session.getTransactionManager().rollback();
-                // Remove the thread local - this thread will be returned, but KeycloakBeanProducer will only fire after the response is resumed.
-                KeycloakSessionUtil.setKeycloakSession(null);
+                logger.tracef("ArtifactResolutionRunnable scheduled");
             } catch (URISyntaxException | ProcessingException | ParsingException | ConfigurationException e) {
                 event.event(EventType.LOGIN);
                 event.detail(Details.REASON, e.getMessage());
                 event.error(Errors.IDENTITY_PROVIDER_ERROR);
-                asyncResponse.resume(error(session, null, Response.Status.INTERNAL_SERVER_ERROR, Messages.UNEXPECTED_ERROR_HANDLING_REQUEST));
-                return;
+                asyncResponse.resume(withBrowserSecurityHeaders(session, error(session, null, Response.Status.INTERNAL_SERVER_ERROR, Messages.UNEXPECTED_ERROR_HANDLING_REQUEST)));
             }
         }
 
         protected abstract String encodeSamlDocument(Document samlDocument) throws ProcessingException;
 
         protected abstract void verifySignature(SAMLDocumentHolder documentHolder, ClientModel client) throws VerificationException;
+
+        protected abstract void verifyResponseSignature(SAMLDocumentHolder documentHolder, ClientModel client) throws VerificationException;
 
         protected abstract boolean containsUnencryptedSignature(SAMLDocumentHolder documentHolder);
 
@@ -532,7 +545,8 @@ public class SamlService extends AuthorizationEndpointBase {
 
             if (null != requestAbstractType.isForceAuthn()
                     && requestAbstractType.isForceAuthn()) {
-                authSession.setAuthNote(SamlProtocol.SAML_LOGIN_REQUEST_FORCEAUTHN, SamlProtocol.SAML_FORCEAUTHN_REQUIREMENT);
+                // The request's reauthentication requirement must survive authentication flow restarts.
+                authSession.setClientNote(SamlProtocol.SAML_LOGIN_REQUEST_FORCEAUTHN, SamlProtocol.SAML_FORCEAUTHN_REQUIREMENT);
             }
 
             for(Iterator<SamlAuthenticationPreprocessor> it = SamlSessionUtils.getSamlAuthenticationPreprocessorIterator(session); it.hasNext();) {
@@ -548,8 +562,7 @@ public class SamlService extends AuthorizationEndpointBase {
                     String acrValue;
                     if (requestAbstractType.getRequestedAuthnContext() != null
                             && !requestAbstractType.getRequestedAuthnContext().getAuthnContextClassRef().isEmpty()) {
-                        acrValue = SamlProtocolUtils.getSelectedLoA(requestAbstractType.getRequestedAuthnContext(),
-                                acrLoaMap, AcrUtils.getMinimumAcrValue(client));
+                        acrValue = SamlProtocolUtils.getSelectedLoA(client, requestAbstractType.getRequestedAuthnContext(), acrLoaMap);
                         if (acrValue == null) {
                             logger.debug("No AuthnContextClassRef is valid for the requested context.");
                             event.detail(Details.REASON, "Invalid RequestedAuthnContext");
@@ -558,6 +571,11 @@ public class SamlService extends AuthorizationEndpointBase {
                         }
                     } else {
                         acrValue = AcrUtils.getMinimumAcrValue(client);
+                        if (acrValue != null && acrLoaMap.get(acrValue) == null) {
+                            logger.warnf("Invalid value '%s' for option '%s' in client '%s' in realm '%s', no minimum value used",
+                                acrValue, Constants.MINIMUM_ACR_VALUE, client.getClientId(), client.getRealm().getName());
+                            acrValue = null;
+                        }
                     }
 
                     if (acrValue != null) {
@@ -651,35 +669,56 @@ public class SamlService extends AuthorizationEndpointBase {
 
                 logger.debug("browser Logout");
                 return authManager.browserLogout(session, realm, userSession, session.getContext().getUri(), clientConnection, headers);
-            } else if (logoutRequest.getSessionIndex() != null) {
+            } else if (!logoutRequest.getSessionIndex().isEmpty()) {
+                // Back-channel SLO via SessionIndex authenticates the requester solely via Issuer.
+                // Without a required (and verified) client signature, Issuer is forgeable — reject.
+                // Note: LogoutRequestType.getSessionIndex() is never null (empty list when absent).
+                if (!samlClient.requiresClientSignature()) {
+                    logger.warnf("SLO LogoutRequest with SessionIndex from client '%s' rejected: " +
+                                    "client signature is not required, so Issuer cannot be authenticated.",
+                            client.getClientId());
+                    event.detail(Details.REASON, "client_signature_not_required");
+                    event.error(Errors.INVALID_SAML_LOGOUT_REQUEST);
+                    return error(session, null, Response.Status.BAD_REQUEST, Messages.INVALID_REQUEST);
+                }
+
                 for (String sessionIndex : logoutRequest.getSessionIndex()) {
 
                     AuthenticatedClientSessionModel clientSession = SamlSessionUtils.getClientSession(session, realm, sessionIndex);
                     if (clientSession == null)
                         continue;
-                    UserSessionModel userSession = clientSession.getUserSession();
-                    if (clientSession.getClient().getClientId().equals(client.getClientId())) {
-                        // remove requesting client from logout
-                        clientSession.setAction(AuthenticationSessionModel.Action.LOGGED_OUT.name());
+
+                    if (!clientSession.getClient().getClientId().equals(client.getClientId())) {
+                        logger.warnf("SLO LogoutRequest from client '%s' references a SessionIndex " +
+                                        "belonging to client '%s' — request rejected.",
+                                client.getClientId(),
+                                clientSession.getClient().getClientId());
+                        event.detail(Details.REASON, "session_index_not_owned_by_issuer");
+                        event.error(Errors.INVALID_SAML_LOGOUT_REQUEST);
+                        return error(session, null, Response.Status.BAD_REQUEST, Messages.INVALID_REQUEST);
                     }
+
+                    UserSessionModel userSession = clientSession.getUserSession();
+                    clientSession.setAction(AuthenticationSessionModel.Action.LOGGED_OUT.name());
 
                     for(Iterator<SamlAuthenticationPreprocessor> it = SamlSessionUtils.getSamlAuthenticationPreprocessorIterator(session); it.hasNext();) {
                         logoutRequest = it.next().beforeProcessingLogoutRequest(logoutRequest, userSession, clientSession);
                     }
 
+                    EventBuilder logoutEvent = event.clone()
+                            .event(EventType.LOGOUT)
+                            .detail(Details.AUTH_METHOD, userSession.getAuthMethod())
+                            .client(session.getContext().getClient())
+                            .user(userSession.getUser())
+                            .session(userSession)
+                            .detail(Details.USERNAME, userSession.getLoginUsername())
+                            .detail(Details.RESPONSE_MODE, getBindingType());
                     try {
-                        event.event(EventType.LOGOUT)
-                                .detail(Details.AUTH_METHOD, userSession.getAuthMethod())
-                                .client(session.getContext().getClient())
-                                .user(userSession.getUser())
-                                .session(userSession)
-                                .detail(Details.USERNAME, userSession.getLoginUsername())
-                                .detail(Details.RESPONSE_MODE, getBindingType());
                         authManager.backchannelLogout(session, realm, userSession, session.getContext().getUri(), clientConnection, headers, true);
-                        event.success();
+                        logoutEvent.success();
                     } catch (Exception e) {
                         logger.warn("Failure with backchannel logout", e);
-                        event.error("Failure with backchannel logout");
+                        logoutEvent.error("Failure with backchannel logout");
                     }
 
                 }
@@ -754,23 +793,27 @@ public class SamlService extends AuthorizationEndpointBase {
                 return handleSamlResponse(samlResponse, relayState);
         }
 
-        public void execute(AsyncResponse asyncReponse, String samlRequest, String samlResponse, String relayState, String artifact) {
+        /**
+         * Async entry point used by GET/POST bindings. Non-artifact flows resume immediately with browser security
+         * headers applied (AsyncResponse otherwise skips {@code KeycloakSecurityHeadersFilter}). Artifact resolution
+         * is scheduled on {@code saml-artifact-pool}.
+         */
+        public void execute(AsyncResponse asyncResponse, String samlRequest, String samlResponse, String relayState, String artifact) {
             Response response = basicChecks(samlRequest, samlResponse, artifact);
 
-            if (response != null){
-                asyncReponse.resume(response);
+            if (response != null) {
+                asyncResponse.resume(withBrowserSecurityHeaders(session, response));
                 return;
             }
 
             if (artifact != null) {
-                handleArtifact(asyncReponse, artifact, relayState);
+                handleArtifact(asyncResponse, artifact, relayState);
                 return;
             }
             if (samlRequest != null) {
-                asyncReponse.resume(handleSamlRequest(samlRequest, relayState));
-                return;
+                asyncResponse.resume(withBrowserSecurityHeaders(session, handleSamlRequest(samlRequest, relayState)));
             } else {
-                asyncReponse.resume(handleSamlResponse(samlResponse, relayState));
+                asyncResponse.resume(withBrowserSecurityHeaders(session, handleSamlResponse(samlResponse, relayState)));
             }
         }
 
@@ -840,6 +883,11 @@ public class SamlService extends AuthorizationEndpointBase {
         }
 
         @Override
+        protected void verifyResponseSignature(SAMLDocumentHolder documentHolder, ClientModel client) throws VerificationException {
+            SamlProtocolUtils.verifyDocumentSignature(session, client, documentHolder.getSamlDocument());
+        }
+
+        @Override
         protected boolean containsUnencryptedSignature(SAMLDocumentHolder documentHolder) {
             Document signedDoc = documentHolder.getSamlDocument();
             NodeList nl = signedDoc.getElementsByTagNameNS(XMLSignature.XMLNS, "Signature");
@@ -886,6 +934,12 @@ public class SamlService extends AuthorizationEndpointBase {
         }
 
         @Override
+        protected void verifyResponseSignature(SAMLDocumentHolder documentHolder, ClientModel client) throws VerificationException {
+            KeyLocator clientKeyLocator = SamlProtocolUtils.createKeyLocatorForClient(session, client, KeyUse.SIG);
+            SamlProtocolUtils.verifyRedirectSignature(documentHolder, clientKeyLocator, session.getContext().getUri(), GeneralConstants.SAML_RESPONSE_KEY);
+        }
+
+        @Override
         protected boolean containsUnencryptedSignature(SAMLDocumentHolder documentHolder) {
             KeycloakUriInfo uriInformation = session.getContext().getUri();
             MultivaluedMap<String, String> encodedParams = uriInformation.getQueryParameters(false);
@@ -928,6 +982,9 @@ public class SamlService extends AuthorizationEndpointBase {
     }
 
     /**
+     * SP-initiated SAML HTTP-Redirect binding. Resumes with realm browser security headers applied explicitly
+     * because {@link AsyncResponse} closes the session before {@link org.keycloak.services.filters.KeycloakSecurityHeadersFilter}.
+     * Artifact resolution is offloaded to {@code saml-artifact-pool}.
      */
     @GET
     public void redirectBinding(@Suspended AsyncResponse asyncResponse, @QueryParam(GeneralConstants.SAML_REQUEST_KEY) String samlRequest, @QueryParam(GeneralConstants.SAML_RESPONSE_KEY) String samlResponse, @QueryParam(GeneralConstants.RELAY_STATE) String relayState, @QueryParam(GeneralConstants.SAML_ARTIFACT_KEY) String artifact) {
@@ -938,6 +995,9 @@ public class SamlService extends AuthorizationEndpointBase {
     }
 
     /**
+     * SP-initiated SAML HTTP-POST binding. Resumes with realm browser security headers applied explicitly
+     * because {@link AsyncResponse} closes the session before {@link org.keycloak.services.filters.KeycloakSecurityHeadersFilter}.
+     * Artifact resolution is offloaded to {@code saml-artifact-pool}.
      */
     @POST
     @NoCache
@@ -1403,24 +1463,30 @@ public class SamlService extends AuthorizationEndpointBase {
         return DocumentUtil.getDocument(new ByteArrayInputStream(bos.toByteArray()));
     }
 
+
+    private static Response withBrowserSecurityHeaders(KeycloakSession session, Response response) {
+        return SecurityHeadersUtils.applyBrowserSecurityHeaders(session, response);
+    }
+
     private ArtifactResolver getArtifactResolver(String artifact) {
         ArtifactResolver artifactResolver = session.getProvider(ArtifactResolver.class, ArtifactBindingUtils.artifactToResolverProviderId(artifact));
         return artifactResolver != null ? artifactResolver : session.getProvider(ArtifactResolver.class);
     }
 
-    private class ArtifactResolutionRunnable implements ScheduledTask{
+
+    private class ArtifactResolutionRunnable implements ScheduledTask {
 
         private final HttpRequest request;
         private final HttpResponse response;
-        private AsyncResponse asyncResponse;
-        private URI clientArtifactBindingURI;
-        private String relayState;
-        private Document doc;
-        private String realmId;
-        private ClientConnection connection;
-        private String bindingType;
+        private final AsyncResponse asyncResponse;
+        private final URI clientArtifactBindingURI;
+        private final String relayState;
+        private final Document doc;
+        private final String realmId;
+        private final ClientConnection connection;
+        private final String bindingType;
 
-        public ArtifactResolutionRunnable(String bindingType, AsyncResponse asyncResponse, Document doc, URI clientArtifactBindingURI, String relayState){
+        public ArtifactResolutionRunnable(String bindingType, AsyncResponse asyncResponse, Document doc, URI clientArtifactBindingURI, String relayState) {
             this.asyncResponse = asyncResponse;
             this.doc = doc;
             this.clientArtifactBindingURI = clientArtifactBindingURI;
@@ -1433,7 +1499,7 @@ public class SamlService extends AuthorizationEndpointBase {
         }
 
         @Override
-        public void run(KeycloakSession session){
+        public void run(KeycloakSession session) {
             // Initialize context
             session.getContext().setHttpRequest(request);
             session.getContext().setHttpResponse(response);
@@ -1446,7 +1512,7 @@ public class SamlService extends AuthorizationEndpointBase {
             }
             session.getContext().setRealm(realm);
 
-            EventBuilder event = new EventBuilder(realm, session, clientConnection);
+            EventBuilder event = new EventBuilder(realm, session, connection);
 
             // Call Artifact Resolution Service
             HttpClientProvider httpClientProvider = session.getProvider(HttpClientProvider.class);
@@ -1470,7 +1536,7 @@ public class SamlService extends AuthorizationEndpointBase {
                     }
 
                     if (logger.isTraceEnabled()) {
-                        logger.tracef("Resolved object: %s" + DocumentUtil.asString(samlDoc.getSamlDocument()));
+                        logger.tracef("Resolved object: %s", DocumentUtil.asString(samlDoc.getSamlDocument()));
                     }
 
                     ArtifactResponseType art = (ArtifactResponseType) samlDoc.getSamlObject();
@@ -1523,7 +1589,7 @@ public class SamlService extends AuthorizationEndpointBase {
 
                 AsyncResponseTransaction.finishAsyncResponseInTransaction(session, asyncResponse,
                         ErrorPage.error(session, null, Response.Status.INTERNAL_SERVER_ERROR, Messages.ARTIFACT_RESOLUTION_SERVICE_INVALID_RESPONSE));
-            } catch(ConfigurationException e) {
+            } catch (ConfigurationException e) {
                 event.event(EventType.LOGIN);
                 event.detail(Details.REASON, e.getMessage());
                 event.error(Errors.IDENTITY_PROVIDER_ERROR);
