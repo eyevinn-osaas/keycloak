@@ -6,7 +6,7 @@
 # the Keycloak distribution is copied verbatim from the official image.
 
 # --- Keycloak distribution --------------------------------------------------
-FROM quay.io/keycloak/keycloak:26.6.2 AS kc-dist
+FROM quay.io/keycloak/keycloak:26.8.1 AS kc-dist
 
 # --- BCrypt password hash provider -------------------------------------------
 # Keycloak ships without bcrypt, so credentials with algorithm "bcrypt"
